@@ -4,7 +4,7 @@ use crate::config::{Config, Settings, env_directive::EnvDirective};
 use crate::duration;
 use crate::file::{display_path, is_executable};
 use crate::task::TaskKey;
-use crate::task::task_context_builder::TaskContextBuilder;
+use crate::task::task_context_builder::{ExtraVars, TaskContextBuilder};
 use crate::task::task_list::split_task_spec;
 use crate::task::task_output::{TaskOutput, trunc};
 use crate::task::task_output_handler::OutputHandler;
@@ -670,7 +670,7 @@ impl TaskExecutor {
         task: &Task,
         env: &BTreeMap<String, String>,
         prefix: &str,
-        extra_vars: Option<IndexMap<String, String>>,
+        extra_vars: Option<ExtraVars>,
     ) -> Result<()> {
         let mut env = env.clone();
         let command = file.to_string_lossy().to_string();
@@ -987,7 +987,7 @@ impl TaskExecutor {
         task: &Task,
         env: &mut BTreeMap<String, String>,
         get_args: impl Fn() -> Vec<String>,
-        extra_vars: Option<IndexMap<String, String>>,
+        extra_vars: Option<ExtraVars>,
     ) -> Result<()> {
         let (spec, _) = task
             .parse_usage_spec_with_vars(config, self.cd.clone(), env, extra_vars)

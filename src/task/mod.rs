@@ -1,4 +1,5 @@
-use crate::config::config_file::mise_toml::EnvList;
+use crate::config::config_file::mise_toml::{EnvList, VarsList};
+use crate::task::task_context_builder::ExtraVars;
 use crate::config::config_file::toml::{TrackingTomlParser, deserialize_arr};
 use crate::config::env_directive::{EnvDirective, EnvResolveOptions, EnvResults, ToolsFilter};
 use crate::config::{self, Config};
@@ -275,7 +276,7 @@ pub struct Task {
     #[serde(default)]
     pub env: EnvList,
     #[serde(default)]
-    pub vars: EnvList,
+    pub vars: VarsList,
     /// Env vars inherited from parent tasks at runtime (not used for task identity/deduplication)
     #[serde(skip)]
     pub inherited_env: EnvList,
@@ -737,7 +738,7 @@ impl Task {
         config: &Arc<Config>,
         cwd: Option<PathBuf>,
         env: &EnvMap,
-        extra_vars: Option<IndexMap<String, String>>,
+        extra_vars: Option<ExtraVars>,
     ) -> Result<(usage::Spec, Vec<String>)> {
         let (mut spec, scripts) = if let Some(file) = self.file_path(config).await? {
             let spec = usage::Spec::parse_script(&file)
@@ -760,13 +761,10 @@ impl Task {
         Ok((spec, scripts))
     }
 
-    fn make_script_parser(
-        cwd: Option<PathBuf>,
-        extra_vars: Option<IndexMap<String, String>>,
-    ) -> TaskScriptParser {
+    fn make_script_parser(cwd: Option<PathBuf>, extra_vars: Option<ExtraVars>) -> TaskScriptParser {
         let parser = TaskScriptParser::new(cwd);
         match extra_vars {
-            Some(vars) => parser.with_extra_vars(vars),
+            Some((vars, toml_vars)) => parser.with_extra_vars(vars, toml_vars),
             None => parser,
         }
     }
@@ -799,7 +797,7 @@ impl Task {
         cwd: Option<PathBuf>,
         args: &[String],
         env: &EnvMap,
-        extra_vars: Option<IndexMap<String, String>>,
+        extra_vars: Option<ExtraVars>,
     ) -> Result<Vec<(String, Vec<String>)>> {
         let (spec, scripts) = self
             .parse_usage_spec_with_vars(config, cwd.clone(), env, extra_vars.clone())
@@ -909,16 +907,22 @@ impl Task {
     pub async fn tera_ctx(&self, config: &Arc<Config>) -> Result<tera::Context> {
         let ts = config.get_toolset().await?;
         let mut tera_ctx = ts.tera_ctx(config).await?.clone();
-        let (mut vars, vars_toml) = self.resolve_base_vars(config).await?;
-        // Insert base vars first so that task-level var templates can reference them
-        // (e.g. a task var `foo = "{{vars.bar}}"` can read a config-level `bar`).
-        tera_ctx.insert(
-            "vars",
-            &crate::config::vars_to_nested_with_json(&vars, &vars_toml)?,
-        );
-        vars.extend(self.resolve_task_vars(config, ts, &tera_ctx).await?);
-        // Re-insert with task-level vars merged in so callers see the final combined map,
-        // with task-level values taking precedence over config-level ones.
+        let (mut vars, mut vars_toml) = self.resolve_base_vars(config).await?;
+        let (task_str_vars, task_toml_vars) = if !self.vars.directives.is_empty()
+            || !self.vars.toml_vars.is_empty()
+        {
+            // Insert base vars first so that task-level var templates can reference them
+            // (e.g. a task var `foo = "{{vars.bar}}"` can read a config-level `bar`).
+            tera_ctx.insert(
+                "vars",
+                &crate::config::vars_to_nested_with_json(&vars, &vars_toml)?,
+            );
+            self.resolve_task_vars(config, ts, &tera_ctx).await?
+        } else {
+            (IndexMap::new(), IndexMap::new())
+        };
+        vars.extend(task_str_vars);
+        vars_toml.extend(task_toml_vars);
         tera_ctx.insert(
             "vars",
             &crate::config::vars_to_nested_with_json(&vars, &vars_toml)?,
@@ -975,9 +979,9 @@ impl Task {
         config: &Arc<Config>,
         ts: &Toolset,
         tera_ctx: &tera::Context,
-    ) -> Result<IndexMap<String, String>> {
-        if self.vars.0.is_empty() {
-            return Ok(IndexMap::new());
+    ) -> Result<(IndexMap<String, String>, IndexMap<String, toml::Value>)> {
+        if self.vars.directives.is_empty() && self.vars.toml_vars.is_empty() {
+            return Ok((IndexMap::new(), IndexMap::new()));
         }
 
         let env_map = ts.full_env(config).await?;
@@ -986,7 +990,7 @@ impl Task {
             tera_ctx.clone(),
             &env_map,
             self.vars
-                .0
+                .directives
                 .iter()
                 .cloned()
                 .map(|directive| (directive, self.config_source.clone()))
@@ -999,11 +1003,12 @@ impl Task {
         )
         .await?;
 
-        Ok(results
+        let str_vars = results
             .vars
             .iter()
             .map(|(k, (v, _))| (k.clone(), v.clone()))
-            .collect())
+            .collect();
+        Ok((str_vars, self.vars.toml_vars.clone()))
     }
 
     pub fn cf<'a>(&'a self, config: &'a Config) -> Option<&'a Arc<dyn ConfigFile>> {

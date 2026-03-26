@@ -1563,7 +1563,7 @@ impl<'de> de::Deserialize<'de> for VarsList {
                 M: de::MapAccess<'de>,
             {
                 /// Recursively flatten a nested TOML table into dot-notation entries.
-                /// String/int/bool/int values go into `directives`; arrays go into `toml_vars`.
+                /// String/int/bool/float values go into `directives`; arrays/floats/datetimes go into `toml_vars`.
                 fn flatten_nested(
                     prefix: &str,
                     val: &toml::Value,
@@ -1669,10 +1669,19 @@ impl<'de> de::Deserialize<'de> for VarsList {
                             .map_err(de::Error::custom)?;
                     } else if matches!(&raw, toml::Value::Table(_)) {
                         // Directive table: delegate to EnvList via toml round-trip (no JSON).
+                        // NOTE: this table was classified as a directive because all of its keys
+                        // are reserved directive keys (age, value, required, redact, tools).
+                        // If you intended a nested var, add a non-reserved key or rename the key.
                         let mut table = toml::Table::new();
-                        table.insert(key, raw);
+                        table.insert(key.clone(), raw);
                         let sub = <EnvList as serde::Deserialize>::deserialize(toml::Value::Table(table))
-                            .map_err(|e: toml::de::Error| de::Error::custom(e.to_string()))?;
+                            .map_err(|e: toml::de::Error| de::Error::custom(format!(
+                                "var '{key}' looks like a directive table (its keys are all \
+                                 reserved: {reserved:?}), but failed to parse as one: {e}. \
+                                 If you meant a nested var, rename one of the keys to something \
+                                 other than {reserved:?}.",
+                                reserved = EnvList::DIRECTIVE_TABLE_KEYS,
+                            )))?;
                         directives.extend(sub.0);
                     }
                 }

@@ -9,13 +9,17 @@ use crate::toolset::{Toolset, ToolsetBuilder};
 use eyre::Result;
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
+use toml;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+
+/// Extra vars from the monorepo task config hierarchy: (string vars, non-string toml vars).
+pub(crate) type ExtraVars = (IndexMap<String, String>, IndexMap<String, toml::Value>);
 
 type EnvResolutionResult = (
     BTreeMap<String, String>,
     Vec<(String, String)>,
-    Option<IndexMap<String, String>>,
+    Option<ExtraVars>,
 );
 
 /// Builds toolset and environment context for task execution
@@ -147,11 +151,7 @@ impl TaskContextBuilder {
         task: &Task,
         task_cf: &Arc<dyn ConfigFile>,
         ts: &Toolset,
-    ) -> Result<(
-        BTreeMap<String, String>,
-        Vec<(String, String)>,
-        Option<IndexMap<String, String>>,
-    )> {
+    ) -> Result<EnvResolutionResult> {
         // Determine if this is a monorepo task (task config differs from current project root)
         let is_monorepo_task = task_cf.project_root() != config.project_root;
 
@@ -327,7 +327,7 @@ impl TaskContextBuilder {
         ts: &Toolset,
         config: &Arc<Config>,
         task_config_files: Option<&IndexMap<PathBuf, Arc<dyn ConfigFile>>>,
-    ) -> Result<(tera::Context, Option<IndexMap<String, String>>)> {
+    ) -> Result<(tera::Context, Option<ExtraVars>)> {
         let mut tera_ctx = ts.tera_ctx(config).await?.clone();
         if let Some(root) = task_cf.project_root() {
             tera_ctx.insert("config_root", &root);
@@ -380,7 +380,7 @@ impl TaskContextBuilder {
                     "vars",
                     &crate::config::vars_to_nested_with_json(&vars, &merged_vars_toml)?,
                 );
-                resolved_vars = Some(vars);
+                resolved_vars = Some((vars, merged_vars_toml));
             }
         }
         Ok((tera_ctx, resolved_vars))

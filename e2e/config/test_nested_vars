@@ -146,3 +146,36 @@ cat <<EOF >mise.toml
 duration = { age = "not-a-valid-age-ciphertext" }
 EOF
 assert_fail "mise env"
+
+# Test 15: cross-file var override — mise.local.toml overrides a nested var from mise.toml,
+# and unset keys from the base config are preserved.
+cat <<EOF >mise.toml
+[vars.db]
+host = "localhost"
+port = "5432"
+
+[tasks.a]
+run = "echo {{vars.db.host}}:{{vars.db.port}}"
+EOF
+cat <<EOF >mise.local.toml
+[vars.db]
+host = "overridden"
+EOF
+assert "mise run a" "overridden:5432"
+rm -f mise.local.toml
+
+# Test 16: task-level vars support nested tables (dotted key syntax)
+cat <<EOF >mise.toml
+[tasks.a]
+vars = { "db.host" = "taskhost" }
+run = "echo {{vars.db.host}}"
+EOF
+assert "mise run a" "taskhost"
+
+# Test 17: task-level vars support nested inline tables
+cat <<EOF >mise.toml
+[tasks.a]
+vars = { db = { host = "inlinehost" } }
+run = "echo {{vars.db.host}}"
+EOF
+assert "mise run a" "inlinehost"

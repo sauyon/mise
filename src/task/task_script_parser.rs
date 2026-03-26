@@ -7,6 +7,7 @@ use crate::tera::get_tera;
 use eyre::{Context, Result};
 use heck::ToSnakeCase;
 use indexmap::IndexMap;
+use toml;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::iter::once;
@@ -22,8 +23,10 @@ type TeraSpecParsingResult = (
 
 pub struct TaskScriptParser {
     dir: Option<PathBuf>,
-    /// Extra vars to inject into the tera context (for monorepo task vars resolution)
+    /// Extra string vars to inject into the tera context (for monorepo task vars resolution)
     extra_vars: Option<IndexMap<String, String>>,
+    /// Extra non-string vars (arrays, floats, etc.) from the monorepo task config hierarchy
+    extra_toml_vars: Option<IndexMap<String, toml::Value>>,
 }
 
 impl TaskScriptParser {
@@ -31,11 +34,17 @@ impl TaskScriptParser {
         TaskScriptParser {
             dir,
             extra_vars: None,
+            extra_toml_vars: None,
         }
     }
 
-    pub fn with_extra_vars(mut self, vars: IndexMap<String, String>) -> Self {
+    pub fn with_extra_vars(
+        mut self,
+        vars: IndexMap<String, String>,
+        toml_vars: IndexMap<String, toml::Value>,
+    ) -> Self {
         self.extra_vars = Some(vars);
+        self.extra_toml_vars = Some(toml_vars);
         self
     }
 
@@ -50,10 +59,20 @@ impl TaskScriptParser {
             // vars already set in the context by task.tera_ctx() (which includes per-task
             // vars). Per-task vars take precedence over config-level vars.
             let mut existing: IndexMap<String, String> = IndexMap::new();
-            let mut existing_json = IndexMap::new();
+            let mut existing_json: IndexMap<String, serde_json::Value> = IndexMap::new();
             if let Some(v) = tera_ctx.get("vars") {
                 existing.extend(crate::config::flatten_vars_from_nested(v));
                 existing_json = crate::config::extract_json_vars_from_nested(v);
+            }
+            // Overlay extra_toml_vars (arrays, floats, datetimes from the monorepo config
+            // hierarchy) — these may not be in the tera context yet if task.tera_ctx() was
+            // built from a different config path.
+            if let Some(extra_toml_vars) = &self.extra_toml_vars {
+                for (k, v) in extra_toml_vars {
+                    existing_json
+                        .entry(k.clone())
+                        .or_insert_with(|| serde_json::to_value(v).unwrap_or_default());
+                }
             }
             let mut merged = extra_vars.clone();
             merged.extend(existing);

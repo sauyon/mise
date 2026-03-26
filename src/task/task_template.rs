@@ -1,4 +1,4 @@
-use crate::config::config_file::mise_toml::EnvList;
+use crate::config::config_file::mise_toml::{EnvList, VarsList};
 use crate::config::config_file::toml::deserialize_arr;
 use crate::task::task_sources::TaskOutputs;
 use crate::task::{RunEntry, Silent, Task, TaskDep};
@@ -24,7 +24,7 @@ pub struct TaskTemplate {
     #[serde(default)]
     pub env: EnvList,
     #[serde(default)]
-    pub vars: EnvList,
+    pub vars: VarsList,
     #[serde(default)]
     pub dir: Option<String>,
     #[serde(default)]
@@ -93,7 +93,8 @@ impl Task {
 
         // vars: deep merge (template first, then local overrides)
         let mut merged_vars = template.vars.clone();
-        merged_vars.0.extend(self.vars.0.clone());
+        merged_vars.directives.extend(self.vars.directives.clone());
+        merged_vars.toml_vars.extend(self.vars.toml_vars.clone());
         self.vars = merged_vars;
 
         // depends: local overrides completely if non-empty

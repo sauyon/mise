@@ -117,7 +117,7 @@ fn insert_nested_var(
 }
 
 /// Flatten a (potentially nested) JSON vars object back into flat dot-notation key-value pairs.
-pub fn flatten_vars_from_nested(val: &serde_json::Value) -> Vec<(String, String)> {
+pub(crate) fn flatten_vars_from_nested(val: &serde_json::Value) -> Vec<(String, String)> {
     let mut result = Vec::new();
     flatten_vars_inner(val, "", &mut result);
     result
@@ -143,7 +143,7 @@ fn flatten_vars_inner(val: &serde_json::Value, prefix: &str, result: &mut Vec<(S
 }
 
 /// Extract non-string JSON values (arrays, etc.) from a nested vars context as flat dot-notation entries.
-pub fn extract_json_vars_from_nested(val: &serde_json::Value) -> IndexMap<String, serde_json::Value> {
+pub(crate) fn extract_json_vars_from_nested(val: &serde_json::Value) -> IndexMap<String, serde_json::Value> {
     let mut result = IndexMap::new();
     extract_json_vars_inner(val, "", &mut result);
     result
