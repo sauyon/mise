@@ -8,7 +8,7 @@ use crate::tera::{get_tera, tera_exec};
 use eyre::{Context, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
-use serde_json::Value;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{Debug, Display, Formatter};
@@ -352,18 +352,15 @@ impl EnvResults {
                 .collect::<EnvMap>();
             ctx.insert("env", &env_vars);
 
-            let mut vars: EnvMap = if let Some(Value::Object(existing_vars)) = ctx.get("vars") {
-                existing_vars
-                    .iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            } else {
-                EnvMap::new()
-            };
-
+            let mut vars: EnvMap = EnvMap::new();
+            let mut existing_json = indexmap::IndexMap::new();
+            if let Some(existing) = ctx.get("vars") {
+                vars.extend(super::flatten_vars_from_nested(existing));
+                existing_json = super::extract_json_vars_from_nested(existing);
+            }
             vars.extend(r.vars.iter().map(|(k, (v, _))| (k.clone(), v.clone())));
 
-            ctx.insert("vars", &vars);
+            ctx.insert("vars", &super::vars_to_nested_with_json(&vars, &existing_json)?);
             let redact = directive.options().redact;
             // trace!("resolve: ctx.get('env'): {:#?}", &ctx.get("env"));
             match directive {

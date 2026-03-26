@@ -44,19 +44,25 @@ impl TaskScriptParser {
     }
 
     /// Inject extra vars (from monorepo task config hierarchy) into the tera context
-    fn inject_extra_vars(&self, tera_ctx: &mut tera::Context) {
+    fn inject_extra_vars(&self, tera_ctx: &mut tera::Context) -> eyre::Result<()> {
         if let Some(extra_vars) = &self.extra_vars {
             // Merge extra_vars (base config-level vars from the config hierarchy) with any
             // vars already set in the context by task.tera_ctx() (which includes per-task
             // vars). Per-task vars take precedence over config-level vars.
-            let existing: IndexMap<String, String> = tera_ctx
-                .get("vars")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+            let mut existing: IndexMap<String, String> = IndexMap::new();
+            let mut existing_json = IndexMap::new();
+            if let Some(v) = tera_ctx.get("vars") {
+                existing.extend(crate::config::flatten_vars_from_nested(v));
+                existing_json = crate::config::extract_json_vars_from_nested(v);
+            }
             let mut merged = extra_vars.clone();
             merged.extend(existing);
-            tera_ctx.insert("vars", &merged);
+            tera_ctx.insert(
+                "vars",
+                &crate::config::vars_to_nested_with_json(&merged, &existing_json)?,
+            );
         }
+        Ok(())
     }
 
     fn render_script_with_context(
@@ -642,7 +648,7 @@ impl TaskScriptParser {
     ) -> Result<(Vec<String>, usage::Spec)> {
         let (mut tera, arg_order, input_args, input_flags) = self.setup_tera_for_spec_parsing(task);
         let mut tera_ctx = task.tera_ctx(config).await?;
-        self.inject_extra_vars(&mut tera_ctx);
+        self.inject_extra_vars(&mut tera_ctx)?;
         tera_ctx.insert("env", &env);
         // First render the usage field to collect the spec and build a default
         // usage map, so that `{{ usage.* }}` references in run scripts do not
@@ -780,7 +786,7 @@ impl TaskScriptParser {
             tera.register_function("option", flag_func("".to_string()));
             tera.register_function("flag", flag_func(false.to_string()));
             let mut tera_ctx = task.tera_ctx(config).await?;
-            self.inject_extra_vars(&mut tera_ctx);
+            self.inject_extra_vars(&mut tera_ctx)?;
             tera_ctx.insert("env", &env);
             let mut usage_map = Self::make_usage_ctx_from_spec_defaults(spec);
             usage_map.extend(Self::make_usage_ctx(&m));

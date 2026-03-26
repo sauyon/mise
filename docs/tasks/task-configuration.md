@@ -641,6 +641,61 @@ vars = { e2e_args = '--headed' }
 
 The task-level `vars` override any config-level vars with the same name. In the example above, `e2e_args` resolves to `'--headed'` instead of the config-level `'--headless'`.
 
+### Nested vars
+
+Vars support nested TOML tables, which are flattened to dot-notation keys and accessible in
+templates as nested objects:
+
+```toml
+[vars.db]
+host = "localhost"
+port = "5432"
+
+[tasks.connect]
+run = "psql {{vars.db.host}}:{{vars.db.port}}"
+```
+
+Inline tables and dotted keys also work:
+
+```toml
+[vars]
+server = { host = "example.com", port = "8080" }
+db.host = "localhost"
+```
+
+### Array vars
+
+Arrays can be stored as vars and iterated in templates.
+
+```toml
+[vars]
+tags = ["staging", "web", "v2"]
+
+[tasks.deploy]
+run = "deploy {% for t in vars.tags %}--tag {{t}} {% endfor %}"
+```
+
+### Type support
+
+String, integer, float, boolean, and datetime values are all supported. Integers and booleans
+are converted to their string representations (`42` → `"42"`, `true` → `"true"`). Floats and
+datetimes are passed as their native types and rendered by the template engine.
+
+### Reserved key names
+
+A nested table is treated as an [env directive](/environments/) (such as an age-encrypted secret)
+if **all** of its keys are directive keys (`age`, `value`, `required`, `redact`, `tools`). This
+means those key names are effectively reserved when used as the sole key in a nested table.
+
+```toml
+[vars]
+# treated as an age directive, not a nested var:
+secret = { age = "YWdlLWVuY3J5cHRpb24..." }
+
+# fine — "host" is not a directive key, so the whole table is a nested var:
+db = { host = "localhost", age = "10y" }
+```
+
 Like `[env]`, vars can also be read in as a file:
 
 ```toml

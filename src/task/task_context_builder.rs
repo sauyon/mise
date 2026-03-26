@@ -347,25 +347,39 @@ impl TaskContextBuilder {
                 .flatten()
                 .collect();
 
-            if !vars_entries.is_empty() {
-                let vars_results = EnvResults::resolve(
-                    config,
-                    tera_ctx.clone(),
-                    &env::PRISTINE_ENV,
-                    vars_entries,
-                    EnvResolveOptions {
-                        vars: true,
-                        tools: ToolsFilter::NonToolsOnly,
-                        warn_on_missing_required: false,
-                    },
-                )
-                .await?;
-                // Merge task vars with existing global vars
+            // Merge toml_vars (arrays etc.) from task config files on top of global ones.
+            let mut merged_vars_toml = config.vars_toml.clone();
+            merged_vars_toml.extend(
+                task_config_files
+                    .values()
+                    .flat_map(|cf| cf.vars_toml_entries()),
+            );
+
+            if !vars_entries.is_empty() || !merged_vars_toml.is_empty() {
                 let mut vars: IndexMap<String, String> = config.vars.clone();
-                for (k, (v, _)) in &vars_results.vars {
-                    vars.insert(k.clone(), v.clone());
+
+                if !vars_entries.is_empty() {
+                    let vars_results = EnvResults::resolve(
+                        config,
+                        tera_ctx.clone(),
+                        &env::PRISTINE_ENV,
+                        vars_entries,
+                        EnvResolveOptions {
+                            vars: true,
+                            tools: ToolsFilter::NonToolsOnly,
+                            warn_on_missing_required: false,
+                        },
+                    )
+                    .await?;
+                    for (k, (v, _)) in &vars_results.vars {
+                        vars.insert(k.clone(), v.clone());
+                    }
                 }
-                tera_ctx.insert("vars", &vars);
+
+                tera_ctx.insert(
+                    "vars",
+                    &crate::config::vars_to_nested_with_json(&vars, &merged_vars_toml)?,
+                );
                 resolved_vars = Some(vars);
             }
         }

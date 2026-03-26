@@ -88,6 +88,9 @@ pub trait ConfigFile: Debug + Send + Sync {
     fn vars_entries(&self) -> Result<Vec<EnvDirective>> {
         Ok(Default::default())
     }
+    fn vars_toml_entries(&self) -> IndexMap<String, ::toml::Value> {
+        Default::default()
+    }
     fn tasks(&self) -> Vec<&Task> {
         Default::default()
     }

@@ -55,12 +55,130 @@ type AliasMap = IndexMap<String, Alias>;
 pub(crate) type ConfigMap = IndexMap<PathBuf, Arc<dyn ConfigFile>>;
 pub type EnvWithSources = IndexMap<String, (String, PathBuf)>;
 
+/// Convert a flat vars map (with dot-notation keys like "foo.bar") into a nested JSON object
+/// so that Tera templates can access values via `{{ vars.foo.bar }}`.
+/// `extra_vars` are non-string values (arrays, etc.) overlaid on top of string vars.
+/// Returns an error if a key collision is detected (e.g. `foo = "x"` and `foo.bar = "y"`).
+pub fn vars_to_nested_with_json<'a, V: serde::Serialize>(
+    vars: impl IntoIterator<Item = (&'a String, &'a String)>,
+    extra_vars: &IndexMap<String, V>,
+) -> eyre::Result<serde_json::Value> {
+    let mut result = serde_json::Map::new();
+    for (key, value) in vars {
+        let parts: Vec<&str> = key.split('.').collect();
+        insert_nested_var(&mut result, &parts, serde_json::Value::String(value.clone()))?;
+    }
+    // Overlay extra_vars (arrays etc.) on top of string vars.
+    for (key, value) in extra_vars {
+        let parts: Vec<&str> = key.split('.').collect();
+        let json_val = serde_json::to_value(value)?;
+        insert_nested_var(&mut result, &parts, json_val)?;
+    }
+    Ok(serde_json::Value::Object(result))
+}
+
+fn insert_nested_var(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    parts: &[&str],
+    value: serde_json::Value,
+) -> eyre::Result<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    if parts.len() == 1 {
+        if let Some(existing) = map.get(parts[0]) {
+            if existing.is_object() {
+                bail!(
+                    "var '{}' conflict: cannot set as a scalar when subtable entries already exist",
+                    parts[0]
+                );
+            }
+            if existing.is_array() != value.is_array() {
+                bail!(
+                    "var '{}' conflict: used as both a scalar and an array across config files",
+                    parts[0]
+                );
+            }
+        }
+        map.insert(parts[0].to_string(), value);
+        return Ok(());
+    }
+    let entry = map
+        .entry(parts[0].to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let serde_json::Value::Object(inner) = entry {
+        insert_nested_var(inner, &parts[1..], value)
+    } else {
+        bail!(
+            "var '{}' conflict: used as both a scalar and a table prefix",
+            parts[0]
+        )
+    }
+}
+
+/// Flatten a (potentially nested) JSON vars object back into flat dot-notation key-value pairs.
+pub fn flatten_vars_from_nested(val: &serde_json::Value) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    flatten_vars_inner(val, "", &mut result);
+    result
+}
+
+fn flatten_vars_inner(val: &serde_json::Value, prefix: &str, result: &mut Vec<(String, String)>) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let new_key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten_vars_inner(v, &new_key, result);
+            }
+        }
+        serde_json::Value::String(s) => {
+            result.push((prefix.to_string(), s.clone()));
+        }
+        _ => {}
+    }
+}
+
+/// Extract non-string JSON values (arrays, etc.) from a nested vars context as flat dot-notation entries.
+pub fn extract_json_vars_from_nested(val: &serde_json::Value) -> IndexMap<String, serde_json::Value> {
+    let mut result = IndexMap::new();
+    extract_json_vars_inner(val, "", &mut result);
+    result
+}
+
+fn extract_json_vars_inner(
+    val: &serde_json::Value,
+    prefix: &str,
+    result: &mut IndexMap<String, serde_json::Value>,
+) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let new_key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                extract_json_vars_inner(v, &new_key, result);
+            }
+        }
+        serde_json::Value::String(_) => {} // handled by flatten_vars_from_nested
+        _ => {
+            result.insert(prefix.to_string(), val.clone());
+        }
+    }
+}
+
 pub struct Config {
     pub config_files: ConfigMap,
     pub project_root: Option<PathBuf>,
     pub all_aliases: AliasMap,
     pub repo_urls: HashMap<String, String>,
     pub vars: IndexMap<String, String>,
+    pub vars_toml: IndexMap<String, toml::Value>,
     pub tera_ctx: tera::Context,
     pub shorthands: Shorthands,
     pub shell_aliases: EnvWithSources,
@@ -140,6 +258,12 @@ impl Config {
             load_all_config_files(&config_paths, &idiomatic_files).await?
         });
 
+        // Collect non-string vars (arrays etc.) from config files before constructing vars_config
+        // so that array vars are available in templates during vars resolution.
+        let vars_toml: IndexMap<String, toml::Value> = config_files
+            .values()
+            .flat_map(|cf| cf.vars_toml_entries())
+            .collect();
         let mut config = Self {
             tera_ctx: BASE_CONTEXT.clone(),
             config_files,
@@ -157,6 +281,7 @@ impl Config {
             shell_aliases: Default::default(),
             tera_files: Default::default(),
             vars: Default::default(),
+            vars_toml: vars_toml.clone(),
             vars_loader: None,
             vars_results: OnceCell::new(),
         };
@@ -177,6 +302,7 @@ impl Config {
             shell_aliases: config.shell_aliases.clone(),
             tera_files: config.tera_files.clone(),
             vars: config.vars.clone(),
+            vars_toml: vars_toml,
             vars_loader: None,
             vars_results: OnceCell::new(),
         });
@@ -192,7 +318,10 @@ impl Config {
             .iter()
             .map(|(k, (v, _))| (k.clone(), v.clone()))
             .collect();
-        config.tera_ctx.insert("vars", &vars);
+        config.tera_ctx.insert(
+            "vars",
+            &vars_to_nested_with_json(&vars, &config.vars_toml)?,
+        );
 
         config.vars = vars;
         config.aliases = load_aliases(&config.config_files)?;

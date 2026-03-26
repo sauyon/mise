@@ -31,8 +31,9 @@ use xx::regex;
 
 static FUZZY_MATCHER: Lazy<SkimMatcherV2> =
     Lazy::new(|| SkimMatcherV2::default().use_cache(true).smart_case());
-static TASK_VARS_CACHE: Lazy<std::sync::Mutex<IndexMap<PathBuf, IndexMap<String, String>>>> =
-    Lazy::new(|| std::sync::Mutex::new(IndexMap::new()));
+static TASK_VARS_CACHE: Lazy<
+    std::sync::Mutex<IndexMap<PathBuf, (IndexMap<String, String>, IndexMap<String, toml::Value>)>>,
+> = Lazy::new(|| std::sync::Mutex::new(IndexMap::new()));
 
 pub(crate) fn reset() {
     TASK_VARS_CACHE.lock().unwrap().clear();
@@ -908,30 +909,39 @@ impl Task {
     pub async fn tera_ctx(&self, config: &Arc<Config>) -> Result<tera::Context> {
         let ts = config.get_toolset().await?;
         let mut tera_ctx = ts.tera_ctx(config).await?.clone();
-        let mut vars = self.resolve_base_vars(config).await?;
+        let (mut vars, vars_toml) = self.resolve_base_vars(config).await?;
         // Insert base vars first so that task-level var templates can reference them
         // (e.g. a task var `foo = "{{vars.bar}}"` can read a config-level `bar`).
-        tera_ctx.insert("vars", &vars);
+        tera_ctx.insert(
+            "vars",
+            &crate::config::vars_to_nested_with_json(&vars, &vars_toml)?,
+        );
         vars.extend(self.resolve_task_vars(config, ts, &tera_ctx).await?);
         // Re-insert with task-level vars merged in so callers see the final combined map,
         // with task-level values taking precedence over config-level ones.
-        tera_ctx.insert("vars", &vars);
+        tera_ctx.insert(
+            "vars",
+            &crate::config::vars_to_nested_with_json(&vars, &vars_toml)?,
+        );
         tera_ctx.insert("config_root", &self.config_root);
         Ok(tera_ctx)
     }
 
-    async fn resolve_base_vars(&self, config: &Arc<Config>) -> Result<IndexMap<String, String>> {
+    async fn resolve_base_vars(
+        &self,
+        config: &Arc<Config>,
+    ) -> Result<(IndexMap<String, String>, IndexMap<String, toml::Value>)> {
         let Some(task_cf) = self.cf(config) else {
-            return Ok(config.vars.clone());
+            return Ok((config.vars.clone(), config.vars_toml.clone()));
         };
 
         if task_cf.project_root() == config.project_root {
-            return Ok(config.vars.clone());
+            return Ok((config.vars.clone(), config.vars_toml.clone()));
         }
 
         let config_path = task_cf.get_path().to_path_buf();
-        if let Some(vars) = TASK_VARS_CACHE.lock().unwrap().get(&config_path) {
-            return Ok(vars.clone());
+        if let Some(cached) = TASK_VARS_CACHE.lock().unwrap().get(&config_path) {
+            return Ok(cached.clone());
         }
 
         let task_dir = task_cf.get_path().parent().unwrap_or(task_cf.get_path());
@@ -947,11 +957,17 @@ impl Task {
             .iter()
             .map(|(k, (v, _))| (k.clone(), v.clone()))
             .collect();
+        let mut vars_toml = config.vars_toml.clone();
+        vars_toml.extend(
+            task_config_files
+                .values()
+                .flat_map(|cf| cf.vars_toml_entries()),
+        );
         TASK_VARS_CACHE
             .lock()
             .unwrap()
-            .insert(config_path, vars.clone());
-        Ok(vars)
+            .insert(config_path, (vars.clone(), vars_toml.clone()));
+        Ok((vars, vars_toml))
     }
 
     async fn resolve_task_vars(

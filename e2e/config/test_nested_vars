@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Test nested vars support in [vars] section
+
+# Test 1: dotted key syntax
+cat <<EOF >mise.toml
+[vars]
+foo.bar = "test"
+
+[tasks.a]
+run = "echo {{vars.foo.bar}}"
+EOF
+assert "mise run a" "test"
+
+# Test 2: TOML subtable syntax [vars.foo]
+cat <<EOF >mise.toml
+[vars.db]
+host = "localhost"
+port = "5432"
+
+[tasks.a]
+run = "echo {{vars.db.host}}:{{vars.db.port}}"
+EOF
+assert "mise run a" "localhost:5432"
+
+# Test 3: inline table syntax
+cat <<EOF >mise.toml
+[vars]
+server = { host = "example.com", port = "8080" }
+
+[tasks.a]
+run = "echo {{vars.server.host}}:{{vars.server.port}}"
+EOF
+assert "mise run a" "example.com:8080"
+
+# Test 4: deeply nested tables
+cat <<EOF >mise.toml
+[vars.a.b]
+c = "deep"
+
+[tasks.a]
+run = "echo {{vars.a.b.c}}"
+EOF
+assert "mise run a" "deep"
+
+# Test 5: flat and nested vars coexist
+cat <<EOF >mise.toml
+[vars]
+simple = "flat"
+
+[vars.nested]
+key = "value"
+
+[tasks.a]
+run = "echo {{vars.simple}} {{vars.nested.key}}"
+EOF
+assert "mise run a" "flat value"
+
+# Test 6: nested var referencing a flat var in a template
+cat <<EOF >mise.toml
+[vars]
+base = "hello"
+
+[vars.msg]
+greeting = "{{vars.base}} world"
+
+[tasks.a]
+run = "echo {{vars.msg.greeting}}"
+EOF
+assert "mise run a" "hello world"
+
+# Test 7: nested [env] tables should be an error
+cat <<EOF >mise.toml
+[env]
+FOO.BAR = "test"
+EOF
+assert_fail "mise env"
+
+# Test 8: array var iterable in template
+cat <<EOF >mise.toml
+[vars]
+items = ["a", "b", "c"]
+
+[tasks.a]
+run = "echo {% for i in vars.items %}{{i}} {% endfor %}"
+EOF
+assert "mise run a" "a b c"
+
+# Test 9: array var alongside string vars
+cat <<EOF >mise.toml
+[vars]
+prefix = "item"
+tags = ["x", "y"]
+
+[tasks.a]
+run = "echo {{vars.prefix}}: {% for t in vars.tags %}{{t}} {% endfor %}"
+EOF
+assert "mise run a" "item: x y"
+
+# Test 10: boolean false sets the var to "false", does not unset it
+cat <<EOF >mise.toml
+[vars]
+enabled = false
+
+[tasks.a]
+run = "echo {{vars.enabled}}"
+EOF
+assert "mise run a" "false"
+
+# Test 11: float values in [vars] are converted to strings
+cat <<EOF >mise.toml
+[vars]
+pi = 3.14
+
+[tasks.a]
+run = "echo {{vars.pi}}"
+EOF
+assert "mise run a" "3.14"
+
+# Test 12: key used as both scalar and table prefix is an error
+cat <<EOF >mise.toml
+[vars]
+foo = "x"
+
+[vars.foo]
+bar = "y"
+EOF
+assert_fail "mise env"
+
+# Test 13: nested table with an "age" key alongside other keys is NOT treated as an age directive
+cat <<EOF >mise.toml
+[vars.person]
+name = "Alice"
+age = "30"
+
+[tasks.a]
+run = "echo {{vars.person.name}} {{vars.person.age}}"
+EOF
+assert "mise run a" "Alice 30"
+
+# Test 14: a table whose ONLY key is "age" (or another directive key) is treated as a directive.
+# Use a non-string age value to force a clear parse error, confirming directive detection.
+# NOTE: a nested var table whose sole key is a directive key (age, value, required, redact, tools)
+# is ambiguous — rename the key or add a second non-directive key to force nested-table treatment.
+cat <<EOF >mise.toml
+[vars]
+duration = { age = "not-a-valid-age-ciphertext" }
+EOF
+assert_fail "mise env"

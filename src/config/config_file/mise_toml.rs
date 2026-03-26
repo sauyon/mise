@@ -112,7 +112,7 @@ pub struct MiseToml {
     #[serde(default)]
     prepare: Option<PrepareConfig>,
     #[serde(default)]
-    vars: EnvList,
+    vars: VarsList,
     #[serde(default)]
     settings: SettingsPartial,
     /// Marks this config as a monorepo root, enabling target path syntax for tasks
@@ -538,7 +538,11 @@ impl ConfigFile for MiseToml {
     }
 
     fn vars_entries(&self) -> eyre::Result<Vec<EnvDirective>> {
-        Ok(self.vars.0.clone())
+        Ok(self.vars.directives.clone())
+    }
+
+    fn vars_toml_entries(&self) -> IndexMap<String, toml::Value> {
+        self.vars.toml_vars.clone()
     }
 
     fn tasks(&self) -> Vec<&Task> {
@@ -711,9 +715,15 @@ impl ConfigFile for MiseToml {
                     .iter()
                     .map(|(k, (v, _))| (k.clone(), v.clone()))
                     .collect::<IndexMap<_, _>>();
-                context.insert("vars", &vars);
+                context.insert(
+                    "vars",
+                    &crate::config::vars_to_nested_with_json(&vars, &config.vars_toml)?,
+                );
             } else if !config.vars.is_empty() {
-                context.insert("vars", &config.vars);
+                context.insert(
+                    "vars",
+                    &crate::config::vars_to_nested_with_json(&config.vars, &config.vars_toml)?,
+                );
             }
         }
         for (ba, tvp) in tools.iter() {
@@ -1154,6 +1164,13 @@ where
     deserializer.deserialize_option(MinVersionVisitor)
 }
 
+impl EnvList {
+    /// Keys whose presence in a table value indicates it should be parsed as an env directive
+    /// (e.g. `{value = "x", redact = true}`) rather than a nested vars table.
+    pub const DIRECTIVE_TABLE_KEYS: &'static [&'static str] =
+        &["age", "value", "required", "redact", "tools"];
+}
+
 impl<'de> de::Deserialize<'de> for EnvList {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -1497,6 +1514,176 @@ impl<'de> de::Deserialize<'de> for EnvList {
         }
 
         deserializer.deserialize_any(EnvManVisitor)
+    }
+}
+
+/// Like [`EnvList`] but additionally supports:
+/// - Nested TOML tables, flattened into dot-notation keys
+///   (`[vars.foo] bar = "x"` → var `"foo.bar" = "x"`)
+/// - Array values (`items = ["a", "b"]`), accessible as `{{ vars.items }}` in templates
+#[derive(Debug, Default, Clone)]
+pub struct VarsList {
+    /// String-valued var directives (compatible with env-var pipeline).
+    pub(crate) directives: Vec<EnvDirective>,
+    /// Non-string vars (arrays, etc.) stored as flat dot-notation TOML values.
+    pub(crate) toml_vars: IndexMap<String, toml::Value>,
+}
+
+impl<'de> de::Deserialize<'de> for VarsList {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct VarsManVisitor;
+
+        impl<'de> Visitor<'de> for VarsManVisitor {
+            type Value = VarsList;
+            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+                formatter.write_str("vars table or array of vars tables")
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> std::result::Result<Self::Value, S::Error>
+            where
+                S: de::SeqAccess<'de>,
+            {
+                let mut directives = vec![];
+                let mut toml_vars = IndexMap::new();
+                while let Some(list) = seq.next_element::<VarsList>()? {
+                    directives.extend(list.directives);
+                    toml_vars.extend(list.toml_vars);
+                }
+                Ok(VarsList {
+                    directives,
+                    toml_vars,
+                })
+            }
+
+            fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                /// Recursively flatten a nested TOML table into dot-notation entries.
+                /// String/int/bool/int values go into `directives`; arrays go into `toml_vars`.
+                fn flatten_nested(
+                    prefix: &str,
+                    val: &toml::Value,
+                    directives: &mut Vec<EnvDirective>,
+                    toml_vars: &mut IndexMap<String, toml::Value>,
+                ) -> Result<(), String> {
+                    if let toml::Value::Table(tbl) = val {
+                        for (k, v) in tbl {
+                            let full_key = format!("{prefix}.{k}");
+                            match v {
+                                toml::Value::Table(_) => {
+                                    flatten_nested(&full_key, v, directives, toml_vars)?;
+                                }
+                                toml::Value::String(s) => {
+                                    directives.push(EnvDirective::Val(
+                                        full_key,
+                                        s.clone(),
+                                        Default::default(),
+                                    ));
+                                }
+                                toml::Value::Integer(i) => {
+                                    directives.push(EnvDirective::Val(
+                                        full_key,
+                                        i.to_string(),
+                                        Default::default(),
+                                    ));
+                                }
+                                toml::Value::Boolean(b) => {
+                                    directives.push(EnvDirective::Val(
+                                        full_key,
+                                        b.to_string(),
+                                        Default::default(),
+                                    ));
+                                }
+                                toml::Value::Array(_) => {
+                                    toml_vars.insert(full_key, v.clone());
+                                }
+                                toml::Value::Float(_) | toml::Value::Datetime(_) => {
+                                    toml_vars.insert(full_key, v.clone());
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+
+                let mut directives = vec![];
+                let mut toml_vars: IndexMap<String, toml::Value> = IndexMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let raw = map.next_value::<toml::Value>()?;
+
+                    // Arrays → toml_vars directly
+                    if let toml::Value::Array(_) = &raw {
+                        toml_vars.insert(key, raw);
+                        continue;
+                    }
+
+                    // Scalars: handle directly so that `false` sets "false" rather than unsetting
+                    match &raw {
+                        toml::Value::String(s) => {
+                            directives.push(EnvDirective::Val(
+                                key,
+                                s.clone(),
+                                Default::default(),
+                            ));
+                            continue;
+                        }
+                        toml::Value::Integer(i) => {
+                            directives.push(EnvDirective::Val(
+                                key,
+                                i.to_string(),
+                                Default::default(),
+                            ));
+                            continue;
+                        }
+                        toml::Value::Boolean(b) => {
+                            directives.push(EnvDirective::Val(
+                                key,
+                                b.to_string(),
+                                Default::default(),
+                            ));
+                            continue;
+                        }
+                        toml::Value::Float(_) | toml::Value::Datetime(_) => {
+                            toml_vars.insert(key, raw);
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    // Tables: plain nested → flatten; directive tables or special keys → delegate to EnvList.
+                    // A table is only treated as a directive if ALL its keys are known directive
+                    // keys (e.g. `{ age = "...", redact = true }`). This allows nested vars whose
+                    // keys happen to include "age" alongside other non-directive keys, while still
+                    // supporting age-encrypted vars and other directives.
+                    let is_nested_table = key != "_"
+                        && key != "mise"
+                        && matches!(&raw, toml::Value::Table(tbl)
+                            if !tbl.keys().all(|k| EnvList::DIRECTIVE_TABLE_KEYS.contains(&k.as_str())));
+
+                    if is_nested_table {
+                        flatten_nested(&key, &raw, &mut directives, &mut toml_vars)
+                            .map_err(de::Error::custom)?;
+                    } else if matches!(&raw, toml::Value::Table(_)) {
+                        // Directive table: delegate to EnvList via toml round-trip (no JSON).
+                        let mut table = toml::Table::new();
+                        table.insert(key, raw);
+                        let sub = <EnvList as serde::Deserialize>::deserialize(toml::Value::Table(table))
+                            .map_err(|e: toml::de::Error| de::Error::custom(e.to_string()))?;
+                        directives.extend(sub.0);
+                    }
+                }
+                Ok(VarsList {
+                    directives,
+                    toml_vars,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(VarsManVisitor)
     }
 }
 
